@@ -44,7 +44,8 @@ A powerful and feature-rich Model Context Protocol (MCP) server for Gmail integr
 ## 🚀 Getting Started
 
 ### Prerequisites
-- Python 3.8+
+- Python 3.12+
+- Python MCP SDK >= 2.0
 - Google Cloud project with Gmail API enabled
 - OAuth 2.0 credentials
 
