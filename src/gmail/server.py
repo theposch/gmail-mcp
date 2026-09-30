@@ -10,9 +10,8 @@ from base64 import urlsafe_b64decode
 from email import message_from_bytes
 import webbrowser
 
-from mcp.server.models import InitializationOptions
 import mcp.types as types
-from mcp.server import NotificationOptions, Server
+from mcp.server import Server
 import mcp.server.stdio
 
 
@@ -264,26 +263,66 @@ class GmailService:
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
 
-    async def get_unread_emails(self) -> list[dict[str, str]]| str:
+    async def get_unread_emails(self, max_results: int = 100) -> list[dict[str, str]]| str:
         """
         Retrieves unread messages from mailbox.
-        Returns list of messsage IDs in key 'id'."""
+        Returns a list of messages with id, threadId, subject, from, date and snippet."""
         try:
             user_id = 'me'
-            query = 'in:inbox is:unread category:primary'
+            query = 'is:unread'
 
-            response = self.service.users().messages().list(userId=user_id,
-                                                        q=query).execute()
+            response = await asyncio.to_thread(
+                self.service.users().messages().list(
+                    userId=user_id,
+                    q=query,
+                    maxResults=max_results
+                ).execute
+            )
+
             messages = []
             if 'messages' in response:
                 messages.extend(response['messages'])
 
-            while 'nextPageToken' in response:
+            while 'nextPageToken' in response and len(messages) < max_results:
                 page_token = response['nextPageToken']
-                response = self.service.users().messages().list(userId=user_id, q=query,
-                                                    pageToken=page_token).execute()
-                messages.extend(response['messages'])
-            return messages
+                response = await asyncio.to_thread(
+                    self.service.users().messages().list(
+                        userId=user_id,
+                        q=query,
+                        pageToken=page_token,
+                        maxResults=max_results - len(messages)
+                    ).execute
+                )
+                if 'messages' in response:
+                    messages.extend(response['messages'])
+
+            result_messages = []
+            for msg in messages:
+                msg_data = await asyncio.to_thread(
+                    self.service.users().messages().get(
+                        userId=user_id,
+                        id=msg['id'],
+                        format='metadata',
+                        metadataHeaders=['Subject', 'From', 'Date']
+                    ).execute
+                )
+
+                headers = msg_data.get('payload', {}).get('headers', [])
+
+                subject = next((header['value'] for header in headers if header['name'].lower() == 'subject'), 'No Subject')
+                sender = next((header['value'] for header in headers if header['name'].lower() == 'from'), 'Unknown Sender')
+                date = next((header['value'] for header in headers if header['name'].lower() == 'date'), '')
+
+                result_messages.append({
+                    'id': msg['id'],
+                    'threadId': msg['threadId'],
+                    'subject': decode_mime_header(subject),
+                    'from': sender,
+                    'date': date,
+                    'snippet': msg_data.get('snippet', '')
+                })
+
+            return result_messages
 
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
@@ -972,16 +1011,13 @@ async def main(creds_file_path: str,
                token_path: str):
     
     gmail_service = GmailService(creds_file_path, token_path)
-    server = Server("gmail")
 
-    @server.list_prompts()
-    async def list_prompts() -> list[types.Prompt]:
-        return list(PROMPTS.values())
+    async def list_prompts(ctx, params) -> types.ListPromptsResult:
+        return types.ListPromptsResult(prompts=list(PROMPTS.values()))
 
-    @server.get_prompt()
-    async def get_prompt(
-        name: str, arguments: dict[str, str] | None = None
-    ) -> types.GetPromptResult:
+    async def get_prompt(ctx, params: types.GetPromptRequestParams) -> types.GetPromptResult:
+        arguments = params.arguments or {}
+        name = params.name
         if name not in PROMPTS:
             raise ValueError(f"Prompt not found: {name}")
 
@@ -1184,15 +1220,14 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
 
         raise ValueError("Prompt implementation not found")
 
-    @server.list_tools()
-    async def handle_list_tools() -> list[types.Tool]:
-        return [
+    async def handle_list_tools(ctx, params) -> types.ListToolsResult:
+        tools_list = [
             types.Tool(
                 name="send-email",
                 description="""Sends email to recipient. 
                 Do not use if user only asked to draft email. 
                 Drafts must be approved before sending.""",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "recipient_id": {
@@ -1215,7 +1250,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 name="trash-email",
                 description="""Moves email to trash. 
                 Confirm before moving email to trash.""",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "email_id": {
@@ -1229,7 +1264,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="get-unread-emails",
                 description="Retrieve unread emails",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {},
                     "required": []
@@ -1238,7 +1273,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="read-email",
                 description="Retrieves given email content",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "email_id": {
@@ -1252,7 +1287,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="mark-email-as-read",
                 description="Marks given email as read",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "email_id": {
@@ -1266,7 +1301,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="open-email",
                 description="Open email in browser",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "email_id": {
@@ -1280,7 +1315,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="create-draft",
                 description="Creates a draft email without sending it",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "recipient_id": {
@@ -1302,7 +1337,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="list-drafts",
                 description="Lists all draft emails",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {},
                     "required": []
@@ -1311,7 +1346,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="list-labels",
                 description="Lists all labels in the user's mailbox",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {},
                     "required": []
@@ -1320,7 +1355,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="create-label",
                 description="Creates a new label",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "name": {
@@ -1334,7 +1369,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="apply-label",
                 description="Applies a label to an email",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "email_id": {
@@ -1352,7 +1387,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="remove-label",
                 description="Removes a label from an email",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "email_id": {
@@ -1370,7 +1405,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="rename-label",
                 description="Renames an existing label",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "label_id": {
@@ -1388,7 +1423,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="delete-label",
                 description="Permanently deletes a label",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "label_id": {
@@ -1402,7 +1437,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="search-by-label",
                 description="Searches for emails with a specific label",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "label_id": {
@@ -1416,7 +1451,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="list-filters",
                 description="Lists all email filters in the user's mailbox",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {},
                     "required": []
@@ -1425,7 +1460,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="get-filter",
                 description="Gets details of a specific filter",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "filter_id": {
@@ -1439,7 +1474,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="create-filter",
                 description="Creates a new email filter",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "from_email": {
@@ -1498,7 +1533,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="delete-filter",
                 description="Deletes a specific filter",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "filter_id": {
@@ -1512,7 +1547,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="search-emails",
                 description="Searches for emails using Gmail's search syntax",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "query": {
@@ -1530,7 +1565,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="create-folder",
                 description="Creates a new folder",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "name": {
@@ -1544,7 +1579,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="move-to-folder",
                 description="Moves an email to a folder",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "email_id": {
@@ -1562,7 +1597,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="list-folders",
                 description="Lists all user-created folders",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {},
                     "required": []
@@ -1571,7 +1606,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="archive-email",
                 description="Archives an email (removes from inbox without deleting)",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "email_id": {
@@ -1585,7 +1620,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="batch-archive",
                 description="Archives multiple emails matching a search query",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "query": {
@@ -1603,7 +1638,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="list-archived",
                 description="Lists archived emails (not in inbox)",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "max_results": {
@@ -1617,7 +1652,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             types.Tool(
                 name="restore-to-inbox",
                 description="Restores an archived email back to the inbox",
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "email_id": {
@@ -1629,11 +1664,12 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 },
             ),
         ]
+        return types.ListToolsResult(tools=tools_list)
 
-    @server.call_tool()
-    async def handle_call_tool(
-        name: str, arguments: dict | None
-    ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+
+    async def handle_call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
+        name = params.name
+        arguments = params.arguments or {}
 
         if name == "send-email":
             recipient = arguments.get("recipient_id")
@@ -1660,12 +1696,18 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 response_text = f"Email sent successfully. Message ID: {send_response['message_id']}"
             else:
                 response_text = f"Failed to send email: {send_response['error_message']}"
-            return [types.TextContent(type="text", text=response_text)]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=response_text )]
+            )
 
         if name == "get-unread-emails":
                 
             unread_emails = await gmail_service.get_unread_emails()
-            return [types.TextContent(type="text", text=str(unread_emails),artifact={"type": "json", "data": unread_emails} )]
+            data = unread_emails
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(data))],
+                structured_content=data if isinstance(data, dict) else ({"data": data, "count": len(data)} if isinstance(data, list) else None),
+            )
         
         if name == "read-email":
             email_id = arguments.get("email_id")
@@ -1673,28 +1715,38 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 raise ValueError("Missing email ID parameter")
                 
             retrieved_email = await gmail_service.read_email(email_id)
-            return [types.TextContent(type="text", text=str(retrieved_email),artifact={"type": "dictionary", "data": retrieved_email} )]
+            data = retrieved_email
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(data))],
+                structured_content=data if isinstance(data, dict) else ({"data": data, "count": len(data)} if isinstance(data, list) else None),
+            )
         if name == "open-email":
             email_id = arguments.get("email_id")
             if not email_id:
                 raise ValueError("Missing email ID parameter")
                 
             msg = await gmail_service.open_email(email_id)
-            return [types.TextContent(type="text", text=str(msg))]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(msg) )]
+            )
         if name == "trash-email":
             email_id = arguments.get("email_id")
             if not email_id:
                 raise ValueError("Missing email ID parameter")
                 
             msg = await gmail_service.trash_email(email_id)
-            return [types.TextContent(type="text", text=str(msg))]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(msg) )]
+            )
         if name == "mark-email-as-read":
             email_id = arguments.get("email_id")
             if not email_id:
                 raise ValueError("Missing email ID parameter")
                 
             msg = await gmail_service.mark_email_as_read(email_id)
-            return [types.TextContent(type="text", text=str(msg))]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(msg) )]
+            )
         elif name == "create-draft":
             recipient_id = arguments.get("recipient_id")
             subject = arguments.get("subject")
@@ -1706,13 +1758,23 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 response_text = f"Draft created successfully. Draft ID: {draft_response['draft_id']}"
             else:
                 response_text = f"Failed to create draft: {draft_response['error_message']}"
-            return [types.TextContent(type="text", text=response_text)]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=response_text )]
+            )
         elif name == "list-drafts":
             drafts = await gmail_service.list_drafts()
-            return [types.TextContent(type="text", text=str(drafts), artifact={"type": "json", "data": drafts})]
+            data = drafts
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(data))],
+                structured_content=data if isinstance(data, dict) else ({"data": data, "count": len(data)} if isinstance(data, list) else None),
+            )
         elif name == "list-labels":
             labels = await gmail_service.list_labels()
-            return [types.TextContent(type="text", text=str(labels), artifact={"type": "json", "data": labels})]
+            data = labels
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(data))],
+                structured_content=data if isinstance(data, dict) else ({"data": data, "count": len(data)} if isinstance(data, list) else None),
+            )
         elif name == "create-label":
             name = arguments.get("name")
             if not name:
@@ -1722,36 +1784,54 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 response_text = f"Label created successfully. Label ID: {label_response['label_id']}, Name: {label_response['name']}"
             else:
                 response_text = f"Failed to create label: {label_response['error_message']}"
-            return [types.TextContent(type="text", text=response_text)]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=response_text )]
+            )
         elif name == "apply-label":
             email_id = arguments.get("email_id")
             label_id = arguments.get("label_id")
             if not email_id or not label_id:
                 raise ValueError("Missing required parameters for applying a label")
             msg = await gmail_service.apply_label(email_id, label_id)
-            return [types.TextContent(type="text", text=str(msg))]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(msg) )]
+            )
         elif name == "remove-label":
             email_id = arguments.get("email_id")
             label_id = arguments.get("label_id")
             if not email_id or not label_id:
                 raise ValueError("Missing required parameters for removing a label")
             msg = await gmail_service.remove_label(email_id, label_id)
-            return [types.TextContent(type="text", text=str(msg))]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(msg) )]
+            )
         elif name == "search-by-label":
             label_id = arguments.get("label_id")
             if not label_id:
                 raise ValueError("Missing required parameter for searching by label")
             messages = await gmail_service.search_by_label(label_id)
-            return [types.TextContent(type="text", text=str(messages), artifact={"type": "json", "data": messages})]
+            data = messages
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(data))],
+                structured_content=data if isinstance(data, dict) else ({"data": data, "count": len(data)} if isinstance(data, list) else None),
+            )
         elif name == "list-filters":
             filters = await gmail_service.list_filters()
-            return [types.TextContent(type="text", text=str(filters), artifact={"type": "json", "data": filters})]
+            data = filters
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(data))],
+                structured_content=data if isinstance(data, dict) else ({"data": data, "count": len(data)} if isinstance(data, list) else None),
+            )
         elif name == "get-filter":
             filter_id = arguments.get("filter_id")
             if not filter_id:
                 raise ValueError("Missing required parameter for getting a filter")
             filter_data = await gmail_service.get_filter(filter_id)
-            return [types.TextContent(type="text", text=str(filter_data), artifact={"type": "dictionary", "data": filter_data})]
+            data = filter_data
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(data))],
+                structured_content=data if isinstance(data, dict) else ({"data": data, "count": len(data)} if isinstance(data, list) else None),
+            )
         elif name == "create-filter":
             from_email = arguments.get("from_email")
             to_email = arguments.get("to_email")
@@ -1771,20 +1851,28 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 response_text = f"Filter created successfully. Filter ID: {filter_response['filter_id']}, Filter: {filter_response['filter']}"
             else:
                 response_text = f"Failed to create filter: {filter_response['error_message']}"
-            return [types.TextContent(type="text", text=response_text)]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=response_text )]
+            )
         elif name == "delete-filter":
             filter_id = arguments.get("filter_id")
             if not filter_id:
                 raise ValueError("Missing required parameter for deleting a filter")
             msg = await gmail_service.delete_filter(filter_id)
-            return [types.TextContent(type="text", text=str(msg))]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(msg) )]
+            )
         elif name == "search-emails":
             query = arguments.get("query")
             max_results = arguments.get("max_results", 50)
             if not query:
                 raise ValueError("Missing required parameter for searching emails")
             messages = await gmail_service.search_emails(query, max_results)
-            return [types.TextContent(type="text", text=str(messages), artifact={"type": "json", "data": messages})]
+            data = messages
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(data))],
+                structured_content=data if isinstance(data, dict) else ({"data": data, "count": len(data)} if isinstance(data, list) else None),
+            )
         elif name == "create-folder":
             name = arguments.get("name")
             if not name:
@@ -1794,17 +1882,25 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 response_text = f"Folder created successfully. Folder ID: {folder_response['folder_id']}, Name: {folder_response['name']}"
             else:
                 response_text = f"Failed to create folder: {folder_response['error_message']}"
-            return [types.TextContent(type="text", text=response_text)]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=response_text )]
+            )
         elif name == "move-to-folder":
             email_id = arguments.get("email_id")
             folder_id = arguments.get("folder_id")
             if not email_id or not folder_id:
                 raise ValueError("Missing required parameters for moving an email to a folder")
             msg = await gmail_service.move_to_folder(email_id, folder_id)
-            return [types.TextContent(type="text", text=str(msg))]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(msg) )]
+            )
         elif name == "list-folders":
             folders = await gmail_service.list_folders()
-            return [types.TextContent(type="text", text=str(folders), artifact={"type": "json", "data": folders})]
+            data = folders
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(data))],
+                structured_content=data if isinstance(data, dict) else ({"data": data, "count": len(data)} if isinstance(data, list) else None),
+            )
         elif name == "rename-label":
             label_id = arguments.get("label_id")
             new_name = arguments.get("new_name")
@@ -1815,52 +1911,68 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 response_text = f"Label renamed successfully. Label ID: {rename_response['label_id']}, New name: {rename_response['name']}"
             else:
                 response_text = f"Failed to rename label: {rename_response['error_message']}"
-            return [types.TextContent(type="text", text=response_text)]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=response_text )]
+            )
         elif name == "delete-label":
             label_id = arguments.get("label_id")
             if not label_id:
                 raise ValueError("Missing required parameter for deleting a label")
             msg = await gmail_service.delete_label(label_id)
-            return [types.TextContent(type="text", text=str(msg))]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(msg) )]
+            )
         elif name == "archive-email":
             email_id = arguments.get("email_id")
             if not email_id:
                 raise ValueError("Missing required parameter for archiving an email")
             msg = await gmail_service.archive_email(email_id)
-            return [types.TextContent(type="text", text=str(msg))]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(msg) )]
+            )
         elif name == "batch-archive":
             query = arguments.get("query")
             max_emails = arguments.get("max_emails", 100)
             if not query:
                 raise ValueError("Missing required parameter for batch archiving")
             archive_response = await gmail_service.batch_archive(query, max_emails)
-            return [types.TextContent(type="text", text=str(archive_response))]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(archive_response) )]
+            )
         elif name == "list-archived":
             max_results = arguments.get("max_results", 50)
             archived_emails = await gmail_service.list_archived(max_results)
-            return [types.TextContent(type="text", text=str(archived_emails), artifact={"type": "json", "data": archived_emails})]
+            data = archived_emails
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(data))],
+                structured_content=data if isinstance(data, dict) else ({"data": data, "count": len(data)} if isinstance(data, list) else None),
+            )
         elif name == "restore-to-inbox":
             email_id = arguments.get("email_id")
             if not email_id:
                 raise ValueError("Missing required parameter for restoring an email to inbox")
             msg = await gmail_service.restore_to_inbox(email_id)
-            return [types.TextContent(type="text", text=str(msg))]
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(msg) )]
+            )
         else:
             logger.error(f"Unknown tool: {name}")
             raise ValueError(f"Unknown tool: {name}")
+
+    server = Server(
+        "gmail",
+        version="0.1.0",
+        on_list_prompts=list_prompts,
+        on_get_prompt=get_prompt,
+        on_list_tools=handle_list_tools,
+        on_call_tool=handle_call_tool,
+    )
 
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
             write_stream,
-            InitializationOptions(
-                server_name="gmail",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
+            server.create_initialization_options(),
         )
 
 if __name__ == "__main__":
