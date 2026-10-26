@@ -87,6 +87,31 @@ mkdir -p ~/.gmail-mcp
 mv ~/Downloads/client_secret_*.json ~/.gmail-mcp/credentials.json
 ```
 
+### Pre-Authentication (Recommended)
+
+MCP clients (such as Claude Desktop) connect over `stdio` with strict initialization timeouts. On the first run, perform interactive authentication once via `--auth-only` to cache your tokens before launching the MCP client:
+
+```bash
+uv run gmail --creds-file-path ~/.gmail-mcp/credentials.json --token-path ~/.gmail-mcp/tokens.json --auth-only
+```
+
+#### Headless Environments & Web Application Credentials
+If running on a remote/headless machine (SSH, Docker, Termux) or using Google Cloud "Web Application" credentials with a fixed redirect URI, specify `--port` and `--redirect-uri`:
+
+```bash
+uv run gmail \
+  --creds-file-path ~/.gmail-mcp/credentials.json \
+  --token-path ~/.gmail-mcp/tokens.json \
+  --redirect-uri http://localhost:3334/oauth/callback \
+  --port 3334 \
+  --auth-only
+```
+
+* **`--auth-only`**: Performs OAuth authorization, writes `tokens.json`, and exits cleanly without starting the MCP server loop.
+* **`--port`**: Configures a fixed port for the local OAuth redirect server (default: `0` for dynamic port).
+* **`--redirect-uri`**: Sets an explicit redirect URI matching your Google Cloud Console configuration.
+* **Headless Fallback**: If a local browser cannot be opened automatically, the authorization URL is displayed in the console for manual copy-pasting.
+
 ## 🔧 Usage
 
 ### Running with Claude Desktop

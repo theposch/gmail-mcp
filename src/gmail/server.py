@@ -8,7 +8,9 @@ from email.message import EmailMessage
 from email.header import decode_header
 from base64 import urlsafe_b64decode
 from email import message_from_bytes
+import urllib.parse
 import webbrowser
+import wsgiref.simple_server
 
 import mcp.types as types
 from mcp.server import Server
@@ -17,7 +19,7 @@ import mcp.server.stdio
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import InstalledAppFlow, _RedirectWSGIApp
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -182,17 +184,63 @@ class GmailService:
     def __init__(self,
                  creds_file_path: str,
                  token_path: str,
-                 scopes: list[str] = ['https://www.googleapis.com/auth/gmail.modify']):
+                 scopes: list[str] = ['https://www.googleapis.com/auth/gmail.modify'],
+                 port: int = 0,
+                 redirect_uri: str | None = None):
         logger.info(f"Initializing GmailService with creds file: {creds_file_path}")
         self.creds_file_path = creds_file_path
         self.token_path = token_path
         self.scopes = scopes
+        self.port = port
+        self.redirect_uri = redirect_uri
         self.token = self._get_token()
         logger.info("Token retrieved successfully")
         self.service = self._get_service()
         logger.info("Gmail service initialized")
         self.user_email = self._get_user_email()
         logger.info(f"User email retrieved: {self.user_email}")
+
+    def _run_local_server(self, flow: InstalledAppFlow) -> Credentials:
+        """Run local redirect server honoring custom redirect_uri and handling headless environments."""
+        if self.redirect_uri:
+            parsed = urllib.parse.urlparse(self.redirect_uri)
+            host = parsed.hostname or "localhost"
+            listen_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        else:
+            host = "localhost"
+            listen_port = self.port
+
+        wsgi_app = _RedirectWSGIApp("Authentication successful! You can close this window.")
+        local_server = wsgiref.simple_server.make_server(
+            host,
+            listen_port,
+            wsgi_app,
+            handler_class=wsgiref.simple_server.WSGIRequestHandler
+        )
+
+        try:
+            if self.redirect_uri:
+                flow.redirect_uri = self.redirect_uri
+            else:
+                flow.redirect_uri = f"http://{host}:{local_server.server_port}/"
+
+            auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+
+            try:
+                webbrowser.get().open(auth_url, new=1, autoraise=True)
+            except webbrowser.Error as e:
+                logger.warning(f"Could not open browser automatically ({e}).")
+
+            logger.info(f"Please visit this URL to authorize this application: {auth_url}")
+            print(f"Please visit this URL to authorize this application: {auth_url}")
+
+            local_server.handle_request()
+            authorization_response = wsgi_app.last_request_uri.replace("http:", "https:", 1)
+            flow.fetch_token(authorization_response=authorization_response)
+        finally:
+            local_server.server_close()
+
+        return flow.credentials
 
     def _get_token(self) -> Credentials:
         """Get or refresh Google API token"""
@@ -209,8 +257,10 @@ class GmailService:
                 token.refresh(Request())
             else:
                 logger.info('Fetching new token')
-                flow = InstalledAppFlow.from_client_secrets_file(self.creds_file_path, self.scopes)
-                token = flow.run_local_server(port=0)
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    self.creds_file_path, self.scopes
+                )
+                token = self._run_local_server(flow)
 
             with open(self.token_path, 'w') as token_file:
                 token_file.write(token.to_json())
@@ -1008,9 +1058,22 @@ class GmailService:
             return f"An HttpError occurred: {str(error)}"
   
 async def main(creds_file_path: str,
-               token_path: str):
+               token_path: str,
+               port: int = 0,
+               redirect_uri: str | None = None,
+               auth_only: bool = False):
     
-    gmail_service = GmailService(creds_file_path, token_path)
+    gmail_service = GmailService(
+        creds_file_path=creds_file_path,
+        token_path=token_path,
+        port=port,
+        redirect_uri=redirect_uri
+    )
+
+    if auth_only:
+        logger.info("Authentication completed successfully. Exiting due to --auth-only flag.")
+        print(f"Authentication successful! Token saved to {token_path}")
+        return
 
     async def list_prompts(ctx, params) -> types.ListPromptsResult:
         return types.ListPromptsResult(prompts=list(PROMPTS.values()))
@@ -1979,10 +2042,28 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Gmail API MCP Server')
     parser.add_argument('--creds-file-path',
                         required=True,
-                       help='OAuth 2.0 credentials file path')
+                        help='OAuth 2.0 credentials file path')
     parser.add_argument('--token-path',
                         required=True,
-                       help='File location to store and retrieve access and refresh tokens for application')
+                        help='File location to store and retrieve access and refresh tokens for application')
+    parser.add_argument('--port',
+                        type=int,
+                        default=0,
+                        help='Port for local OAuth redirect server (default: 0 for dynamic port)')
+    parser.add_argument('--redirect-uri',
+                        default=None,
+                        help='Custom redirect URI (useful for Web Application OAuth credentials)')
+    parser.add_argument('--auth-only',
+                        action='store_true',
+                        help='Perform interactive authentication, save tokens, and exit without starting MCP server')
     
     args = parser.parse_args()
-    asyncio.run(main(args.creds_file_path, args.token_path))
+    asyncio.run(
+        main(
+            creds_file_path=args.creds_file_path,
+            token_path=args.token_path,
+            port=args.port,
+            redirect_uri=args.redirect_uri,
+            auth_only=args.auth_only,
+        )
+    )
